@@ -1,0 +1,21 @@
+[package]
+name = "toytcp"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+pnet = "0.27.2"
+# 低レイヤなネットワークプログラミングを扱うためのクレート
+# Rustの標準モジュールである`std::net`には、トランスポート例や以下のプログラミングを行うこてとはできない。
+
+anyhow = "1.0"
+# Rustでのエラー処理を行うためのクレート
+
+rand = "0.8"
+# 乱数を扱うクレート
+
+[dev-dependencies]
+ctrlc = "3.1"
+# Ctrl+Cによるシグナルを簡単にハンドリンクするためのクレート
