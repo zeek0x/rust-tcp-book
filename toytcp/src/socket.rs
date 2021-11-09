@@ -5,11 +5,59 @@ use pnet::packet::{ip::IpNextHeaderProtocols, Packet};
 use pnet::transport::{self, TransportChannelType, TransportProtocol, TransportSender};
 use pnet::util;
 use std::collections::VecDeque;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::SystemTime;
 
 const SOCKET_BUFFER_SIZE: usize = 4380;
+
+// TCPソケット状態遷移
+// https://datatracker.ietf.org/doc/html/rfc793
+//
+//                               +---------+ ---------\      active OPEN
+//                               |  CLOSED |            \    -----------
+//                               +---------+<---------\   \   create TCB
+//                                 |     ^              \   \  snd SYN
+//                    passive OPEN |     |   CLOSE        \   \
+//                    ------------ |     | ----------       \   \
+//                     create TCB  |     | delete TCB         \   \
+//                                 V     |                      \   \
+//                               +---------+            CLOSE    |    \
+//                               |  LISTEN |          ---------- |     |
+//                               +---------+          delete TCB |     |
+//                    rcv SYN      |     |     SEND              |     |
+//                   -----------   |     |    -------            |     V
+//  +---------+      snd SYN,ACK  /       \   snd SYN          +---------+
+//  |         |<-----------------           ------------------>|         |
+//  |   SYN   |                    rcv SYN                     |   SYN   |
+//  |   RCVD  |<-----------------------------------------------|   SENT  |
+//  |         |                    snd ACK                     |         |
+//  |         |------------------           -------------------|         |
+//  +---------+   rcv ACK of SYN  \       /  rcv SYN,ACK       +---------+
+//    |           --------------   |     |   -----------
+//    |                  x         |     |     snd ACK
+//    |                            V     V
+//    |  CLOSE                   +---------+
+//    | -------                  |  ESTAB  |
+//    | snd FIN                  +---------+
+//    |                   CLOSE    |     |    rcv FIN
+//    V                  -------   |     |    -------
+//  +---------+          snd FIN  /       \   snd ACK          +---------+
+//  |  FIN    |<-----------------           ------------------>|  CLOSE  |
+//  | WAIT-1  |------------------                              |   WAIT  |
+//  +---------+          rcv FIN  \                            +---------+
+//    | rcv ACK of FIN   -------   |                            CLOSE  |
+//    | --------------   snd ACK   |                           ------- |
+//    V        x                   V                           snd FIN V
+//  +---------+                  +---------+                   +---------+
+//  |FINWAIT-2|                  | CLOSING |                   | LAST-ACK|
+//  +---------+                  +---------+                   +---------+
+//    |                rcv ACK of FIN |                 rcv ACK of FIN |
+//    |  rcv FIN       -------------- |    Timeout=2MSL -------------- |
+//    |  -------              x       V    ------------        x       V
+//     \ snd ACK                 +---------+delete TCB         +---------+
+//      ------------------------>|TIME WAIT|------------------>| CLOSED  |
+//                               +---------+                   +---------+
 
 // (local_addr, remote_addr, local_port, remote_port)のタプルでソケットを識別する
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
@@ -20,10 +68,83 @@ pub struct Socket {
     pub remote_addr: Ipv4Addr,
     pub local_port: u16,
     pub remote_port: u16,
-    pub sender: TransportSender
+
+
+    // 送信に関する情報を保持する
+    pub send_param: SendParam,
+
+    // 受信に関する情報を保持する
+    pub recv_param: RecvParam,
+
+    // TCPソケットが管理するコネクションの状態を保持する
+    pub status: TcpStatus,
+    pub sender: TransportSender,
 }
 
-pub enum TcpStatus {}
+// SnedParam構造体パラメータの位置関係
+//      1         2          3          4
+// ----------|----------|----------|----------
+//        SND.UNA    SND.NXT    SND.UNA
+//                             +SND.WND
+// 1 - 確認応答受信済み
+// 2 - 送信したが、確認応答末受信
+// 3 - 送信可能
+// 4 - まだ送信不可能
+#[derive(Clone, Debug)]
+pub struct SendParam {
+    pub unacked_seq: u32, // 送信後まだackされていないseqの先頭
+    pub next: u32,        // 次の送信seq
+    pub window: u16,      // 送信ウィンドウサイズ
+    pub initial_seq: u32, // 初期送信seq
+}
+
+// SnedParam構造体パラメータの位置関係
+//      1          2          3
+// ----------|----------|----------
+//        RCV.NXT    RCV.NXT
+//                  +RCV.WND
+// 1 - 確認応答送信済み
+// 2 - 受信受け入れ可能
+// 3 - まだ受信受け入れ不可能
+#[derive(Clone, Debug)]
+pub struct RecvParam {
+    pub next: u32,        // 次受信するseq
+    pub window: u16,      // 受信ウィンドウサイズ
+    pub initial_seq: u32, // 初期受信seq
+    pub tail: u32,        // 受信seqの末尾
+}
+
+// CLOSEDの状態からESTAへと遷移するには２通りの方法がある。
+// - アクティブオープン：通信相手のホストへ最初にSYNセグメントを送信し、能動的にコネクションを確立する方法
+// - パッシブオープン：通信相手のホストから最初にSYNセグメントを受け入れ、受動的にコネクションを確立する方法
+// 一般的なWebサーバはパッシブオープンを、クライアントとなるブラウザはそれに対してアクティブオープンを行う。
+pub enum TcpStatus {
+    Listen,
+    SynSent,
+    SynRcvd,
+    Established,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    CloseWait,
+    LastAck,
+}
+
+impl Debug for TcpStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TcpStatus::Listen => write!(f, "LISTEN"),
+            TcpStatus::SynSent => write!(f, "SYNSENT"),
+            TcpStatus::SynRcvd => write!(f, "SYNRCVD"),
+            TcpStatus::Established => write!(f, "ESTABLISHED"),
+            TcpStatus::FinWait1 => write!(f, "FINWAIT1"),
+            TcpStatus::FinWait2 => write!(f, "FINWAIT2"),
+            TcpStatus::TimeWait => write!(f, "TIMEWAIT"),
+            TcpStatus::CloseWait => write!(f, "CLOSEWAIT"),
+            TcpStatus::LastAck => write!(f, "LASTACK"),
+        }
+    }
+}
 
 impl Socket {
     pub fn new(
@@ -31,29 +152,64 @@ impl Socket {
         remote_addr: Ipv4Addr,
         local_port: u16,
         remote_port: u16,
+        status: TcpStatus
     ) -> Result<Self> {
         let (sender, _) = transport::transport_channel(
             65535,
             TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)),
         )?;
-        Ok(Self{
+        Ok(Self {
             local_addr,
             remote_addr,
             local_port,
             remote_port,
-            sender
+            send_param: SendParam {
+                unacked_seq: 0,
+                initial_seq: 0,
+                next: 0,
+                window: SOCKET_BUFFER_SIZE as u16,
+            },
+            recv_param: RecvParam {
+                initial_seq: 0,
+                next: 0,
+                window: SOCKET_BUFFER_SIZE as u16,
+                tail: 0,
+            },
+            status,
+            sender,
         })
     }
-    pub fn send_tcp_packet(&mut self, flag: u8, payload: &[u8]) -> Result<usize> {
+
+    pub fn send_tcp_packet(
+        &mut self,
+        seq: u32,
+        ack: u32,
+        flag: u8,
+        payload: &[u8]
+    ) -> Result<usize> {
         let mut tcp_packet = TCPPacket::new(payload.len());
         tcp_packet.set_src(self.local_port);
         tcp_packet.set_dest(self.remote_port);
+        tcp_packet.set_seq(seq);
+        tcp_packet.set_ack(ack);
+        tcp_packet.set_data_offset(5);
         tcp_packet.set_flag(flag);
+        tcp_packet.set_window_size(self.recv_param.window);
+        tcp_packet.set_payload(payload);
+        tcp_packet.set_checksum(util::ipv4_checksum(
+            &tcp_packet.packet(),
+            8,
+            &[],
+            &self.local_addr,
+            &self.remote_addr,
+            IpNextHeaderProtocols::Tcp,
+        ));
         let sent_size = self
             .sender
             .send_to(tcp_packet.clone(), IpAddr::V4(self.remote_addr))
-            .unwrap();
-            Ok(sent_size)
+            .context(format!("failed to send: \n{:?}", tcp_packet))?;
+        dbg!("sent", &tcp_packet);
+        Ok(sent_size)
     }
 
     pub fn get_sock_id(&self) -> SockID {
