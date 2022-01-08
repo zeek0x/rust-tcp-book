@@ -69,7 +69,6 @@ pub struct Socket {
     pub local_port: u16,
     pub remote_port: u16,
 
-
     // 送信に関する情報を保持する
     pub send_param: SendParam,
 
@@ -78,6 +77,12 @@ pub struct Socket {
 
     // TCPソケットが管理するコネクションの状態を保持する
     pub status: TcpStatus,
+
+    // 接続済みソケットを保持するキュー。リスニングソケットのみ使用
+    pub connected_connection_queue: VecDeque<SockID>,
+
+    // 生成元のリスニングソケット。接続済みソケットのみ使用
+    pub listening_socket: Option<SockID>,
     pub sender: TransportSender,
 }
 
@@ -176,6 +181,8 @@ impl Socket {
                 tail: 0,
             },
             status,
+            connected_connection_queue: VecDeque::new(),
+            listening_socket: None,
             sender,
         })
     }
