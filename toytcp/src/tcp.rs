@@ -181,6 +181,34 @@ impl TCP {
 
     }
 
+    // リスニングソケットを生成してソケットIDを返す
+    pub fn listen(&self, local_addr: Ipv4Addr, local_port: u16) -> Result<SockID> {
+        let socket = Socket::new(
+            local_addr,
+            UNDETERMINED_IP_ADDR, // まだ接続先IPアドレスは未定
+            local_port,
+            UNDETERMINED_PORT, // まだ接続先ポート番号は未定
+            TcpStatus::Listen,
+        )?;
+        let mut lock = self.sockets.write().unwrap();
+        let sock_id = socket.get_sock_id();
+        lock.insert(sock_id, socket);
+        Ok(sock_id)
+    }
+
+    // 接続済みソケットが生成されるまで待機し、生成されたらそのIDを返す
+    pub fn accept(&self, sock_id: SockID) -> Result<SockID> {
+        self.wait_event(sock_id, TCPEventKind::ConnectionCompleted);
+
+        let mut table = self.sockets.write().unwrap();
+        Ok(table
+            .get_mut(&sock_id)
+            .context(format!("no such socket: {:?}", sock_id))?
+            .connected_connection_queue
+            .pop_front()
+            .context("no connected socket")?)
+    }
+
     fn select_unused_port(&self, rng: &mut ThreadRng) -> Result<u16> {
         for _ in 0..(PORT_RANGE.end - PORT_RANGE.start) {
             let local_port = rng.gen_range(PORT_RANGE);
