@@ -69,6 +69,76 @@ impl TCP {
         cvar.notify_all();
     }
 
+    // LISTEN状態のソケットに到着したパケットの処理
+    fn listen_handler(
+        &self,
+        mut table: RwLockWriteGuard<HashMap<SockID, Socket>>,
+        listening_socket_id: SockID,
+        packet: &TCPPacket,
+        remote_addr: Ipv4Addr,
+    ) -> Result<()> {
+        dbg!("listen handler");
+        if packet.get_flag() & tcpflags::ACK > 0 {
+            // 本来ならRSTをsendする
+            return Ok(());
+        }
+        let listening_socket = table.get_mut(&listening_socket_id).unwrap();
+        if packet.get_flag() & tcpflags::SYN > 0 {
+            // passive openの処理
+            // 後に接続済みソケットとなるソケットを新たに生成する
+            let mut connection_socket = Socket::new(
+                listening_socket.local_addr,
+                remote_addr,
+                listening_socket.local_port,
+                packet.get_src(),
+                TcpStatus::SynRcvd,
+            )?;
+            connection_socket.recv_param.next = packet.get_seq() + 1;
+            connection_socket.recv_param.initial_seq = packet.get_seq();
+            connection_socket.send_param.initial_seq = rand::thread_rng().gen_range(1..1 << 31);
+            connection_socket.send_param.window = packet.get_window_size();
+            connection_socket.send_tcp_packet(
+                connection_socket.send_param.initial_seq,
+                connection_socket.recv_param.next,
+                tcpflags::SYN | tcpflags::ACK,
+                &[],
+            )?;
+            connection_socket.send_param.next = connection_socket.send_param.initial_seq + 1;
+            connection_socket.send_param.unacked_seq = connection_socket.send_param.initial_seq;
+            connection_socket.listening_socket = Some(listening_socket.get_sock_id());
+            dbg!("status: listen -> ", &connection_socket.status);
+            table.insert(connection_socket.get_sock_id(), connection_socket);
+        }
+        Ok(())
+    }
+
+    /// SYNRCVD状態のソケットに到着したパケットの処理
+    fn synrcvd_handler(
+        &self,
+        mut table: RwLockWriteGuard<HashMap<SockID, Socket>>,
+        sock_id: SockID,
+        packet: &TCPPacket,
+    ) -> Result<()> {
+        dbg!("synrcvd handler");
+        let socket = table.get_mut(&sock_id).unwrap();
+
+        if packet.get_flag() & tcpflags::ACK > 0
+            && socket.send_param.unacked_seq <= packet.get_ack()
+            && packet.get_ack() <= socket.send_param.next
+        {
+            socket.recv_param.next = packet.get_seq();
+            socket.send_param.unacked_seq = packet.get_ack();
+            socket.status = TcpStatus::Established;
+            dbg!("status: synrcvd ->", &socket.status);
+            if let Some(id) = socket.listening_socket {
+                let ls = table.get_mut(&id).unwrap();
+                ls.connected_connection_queue.push_back(sock_id);
+                self.publish_event(ls.get_sock_id(), TCPEventKind::ConnectionCompleted);
+            }
+        }
+        Ok(())
+    }
+
     // SYNSENT状態のソケットに到着したパケットの処理
     // SYNを送信した後なので、相手からSYN|ACKセグメントを受け取ればコネクションが確立され、アクティブオープン成功になる
     fn synsent_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
@@ -170,6 +240,9 @@ impl TCP {
             // ソケットの状態から対応するハンドラを呼び出す
             if let Err(error) = match socket.status {
                 TcpStatus::SynSent => self.synsent_handler(socket, &packet),
+                TcpStatus::Listen => self.listen_handler(table, sock_id, &packet, remote_addr),
+                TcpStatus::SynRcvd => self.synrcvd_handler(table, sock_id, &packet),
+                TcpStatus::SynSent => self.synsent_handler(socket, &packet),
                 _ => {
                     dbg!("not implemented state");
                     Ok(())
@@ -198,6 +271,8 @@ impl TCP {
 
     // 接続済みソケットが生成されるまで待機し、生成されたらそのIDを返す
     pub fn accept(&self, sock_id: SockID) -> Result<SockID> {
+        // Queueを介さずにcond_varでSockIDを送れたりしないんだろうか...と思ったが、CondVarで扱うのはbooleanだった。
+        // アクターモデルのようにイベントと一緒に変数を送れるたりしたら良さそうだね
         self.wait_event(sock_id, TCPEventKind::ConnectionCompleted);
 
         let mut table = self.sockets.write().unwrap();
