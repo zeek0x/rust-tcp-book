@@ -20,13 +20,26 @@ const MSS: usize = 1460;
 const PORT_RANGE: Range<u16> = 40000..60000;
 
 pub struct TCP {
-    sockets: HashMap<SockID, Socket>,
+    // ハッシュテーブルは複数のスレッドから書き込まれるためRwLockで保護する
+    // RwLockは多数のreaderまたは最大1人のwriterを許可する
+    sockets: RwLock<HashMap<SockID, Socket>>,
+    event_condvar: (Mutex<Option<TCPEvent>>, Condvar),
 }
 
 impl TCP {
-    pub fn new() -> Self {
-        let sockets = HashMap::new();
-        let tcp = Self { sockets };
+    pub fn new() -> Arc<Self> {
+        let sockets = RwLock::new(HashMap::new());
+        // Arcを返す
+        // Arc/Rcは参照カウントされた共有スマートポインタ
+        let tcp = Arc::new(Self {
+            sockets,
+            event_condvar: (Mutex::new(None), Condvar::new()),
+        });
+        let cloned_tcp = tcp.clone();
+        std::thread::spawn(move || {
+            // パケットの受診用スレッド
+            cloned_tcp.receive_handler().unwrap();
+        });
         tcp
     }
 
