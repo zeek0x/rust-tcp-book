@@ -44,19 +44,41 @@ impl TCP {
     }
 
     fn select_unused_port(&self, rng: &mut ThreadRng) -> Result<u16> {
-        Ok(33445)
+        for _ in 0..(PORT_RANGE.end - PORT_RANGE.start) {
+            let local_port = rng.gen_range(PORT_RANGE);
+            let table = self.sockets.read().unwrap();
+            if table.keys().all(|k| local_port != k.2) {
+                return Ok(local_port);
+            }
+        }
+        anyhow::bail!("no available port found.");
     }
 
+    // ターゲットに接続し、接続済みソケットのIDを返す
     pub fn connect(&self, addr: Ipv4Addr, port: u16) -> Result<SockID> {
         let mut rng = rand::thread_rng();
         let mut socket = Socket::new(
             get_source_addr_to(addr)?,
             addr,
+            // コネクションを一意に特定するために未使用のポートを選択する
             self.select_unused_port(&mut rng)?,
             port,
+            TcpStatus::SynSent,
         )?;
-        socket.send_tcp_packet(tcpflags::SYN, &[])?;
+        // 初期シーケンス番号は乱数で選ぶ
+        // - 以前に利用されたコネクションのシーケンス番号との混乱を避けるため
+        // - TCPシーケンス番号予測攻撃を避けるため
+        socket.send_param.initial_seq = rng.gen_range(1..1<<31);
+        socket.send_tcp_packet(socket.send_param.initial_seq, 0, tcpflags::SYN, &[])?;
+        socket.send_param.unacked_seq = socket.send_param.initial_seq;
+        // SYNセグメントはペイロードを持たないが、確認応答を受けるために１つインクリメントする
+        socket.send_param.next = socket.send_param.initial_seq + 1;
+        let mut table = self.sockets.write().unwrap();
         let sock_id = socket.get_sock_id();
+        table.insert(sock_id, socket);
+        // ロックを外してイベントの待機。受信スレッドがロックを取得できるようにするため。
+        drop(table);
+        self.wait_event(sock_id, TCPEventKind::ConnectionCompleted);
         Ok(sock_id)
     }
 }
