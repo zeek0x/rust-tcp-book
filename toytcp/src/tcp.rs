@@ -43,6 +43,118 @@ impl TCP {
         tcp
     }
 
+    // SYNSENT状態のソケットに到着したパケットの処理
+    // SYNを送信した後なので、相手からSYN|ACKセグメントを受け取ればコネクションが確立され、アクティブオープン成功になる
+    fn synsent_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+        dbg!("synsent handler");
+        // ACKビットが立っている
+        if packet.get_flag() & tcpflags::ACK > 0
+            // セグメントの確認応答番号は正しい範囲内に含まれる必要がある
+            && socket.send_param.unacked_seq <= packet.get_ack()
+            && packet.get_ack() <= socket.send_param.next
+            // SYNビットが立っている
+            && packet.get_flag() & tcpflags::SYN > 0
+        {
+            socket.recv_param.next = packet.get_seq() + 1;
+            socket.recv_param.initial_seq = packet.get_seq();
+            socket.send_param.unacked_seq = packet.get_ack();
+            socket.send_param.window = packet.get_window_size();
+            if socket.send_param.unacked_seq > socket.send_param.initial_seq {
+                socket.status = TcpStatus::Established;
+                socket.send_tcp_packet(
+                    socket.send_param.next,
+                    socket.recv_param.next,
+                    tcpflags::ACK,
+                    &[],
+                )?;
+                dbg!("status: synsend ->", &socket.status);
+                self.publish_event(socket.get_sock_id(), TCPEventKind::ConnectionCompleted);
+            } else {
+                // SYNSENTの状態でSYNを受け取ったらSYNRCVDに遷移する
+                // 一つ上のifでACKが立っていることを条件にしているのでSYNを受け取らないような？
+                socket.status = TcpStatus::SynRcvd;
+                socket.send_tcp_packet(
+                    socket.send_param.next,
+                    socket.recv_param.next,
+                    tcpflags::ACK,
+                    &[],
+                )?;
+                dbg!("status: synsent ->", &socket.status);
+            }
+        }
+        Ok(())
+    }
+
+    // 受信スレッド用のメソッド
+    fn receive_handler(&self) -> Result<()> {
+        dbg!("begin recv thread");
+        let (_, mut receiver) = transport::transport_channel(
+            65535,
+            // IPアドレスが必要なのでIPパケットレベルで取得
+            TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp),
+        ).unwrap();
+        let mut packet_iter = transport::ipv4_packet_iter(&mut receiver);
+        loop {
+            // パケットを受信するまでスレッドをブロックして待機する
+            let (packet, remote_addr) = match packet_iter.next() {
+                Ok((p, r)) => (p, r),
+                Err(_) => continue,
+            };
+            let local_addr = packet.get_destination();
+            // pnetのTcpPacketを生成
+            let tcp_packet = match TcpPacket::new(packet.payload()) {
+                Some(p) => p,
+                None => {
+                    continue;
+                }
+            };
+            // pnetのTcpPacketからtcp::TCPPacketに変換する
+            let packet = TCPPacket::from(tcp_packet);
+            let remote_addr = match remote_addr {
+                IpAddr::V4(addr) => addr,
+                _ => { continue; }
+            };
+            // RwLockからwriteでロックを取得し、中身(HashMap)を取り出す
+            let mut table = self.sockets.write().unwrap();
+            // ヘッダの情報から対応するソケットを取り出す
+            // mapの値を取得するときにはキーの型の借用にしないといけない
+            // 取得した値を変更するので、getでなくget_mutを使う
+            let socket = match table.get_mut(&SockID(
+                local_addr,
+                remote_addr,
+                packet.get_dest(),
+                packet.get_src(),
+            )) {
+                Some(socket) => socket, // 接続済みソケット
+                None => match table.get_mut(&SockID(
+                    local_addr,
+                    UNDETERMINED_IP_ADDR,
+                    packet.get_dest(),
+                    UNDETERMINED_PORT,
+                )) {
+                    Some(socket) => socket, // リスニングソケット
+                    None => continue, // どのソケットにも該当しないものは無視
+                },
+            };
+            if !packet.is_correct_checksum(local_addr, remote_addr) {
+                dbg!("invalid checksum");
+                continue;
+            }
+            let sock_id = socket.get_sock_id();
+            // ソケットの状態から対応するハンドラを呼び出す
+            if let Err(error) = match socket.status {
+                TcpStatus::SynSent => self.synsent_handler(socket, &packet),
+                _ => {
+                    dbg!("not implemented state");
+                    Ok(())
+                }
+            } {
+                dbg!(error);
+            }
+        }
+
+    }
+
     fn select_unused_port(&self, rng: &mut ThreadRng) -> Result<u16> {
         for _ in 0..(PORT_RANGE.end - PORT_RANGE.start) {
             let local_port = rng.gen_range(PORT_RANGE);
