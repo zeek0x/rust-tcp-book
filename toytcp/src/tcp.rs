@@ -23,6 +23,7 @@ pub struct TCP {
     // ハッシュテーブルは複数のスレッドから書き込まれるためRwLockで保護する
     // RwLockは多数のreaderまたは最大1人のwriterを許可する
     sockets: RwLock<HashMap<SockID, Socket>>,
+    // TCPEventをCondVarを通じて送受信する
     event_condvar: (Mutex<Option<TCPEvent>>, Condvar),
 }
 
@@ -41,6 +42,31 @@ impl TCP {
             cloned_tcp.receive_handler().unwrap();
         });
         tcp
+    }
+
+    /// 指定したソケットIDと種別のイベントを待機
+    fn wait_event(&self, sock_id: SockID, kind: TCPEventKind) {
+        let (lock, cvar) = &self.event_condvar;
+        let mut event = lock.lock().unwrap();
+        loop {
+            if let Some(ref e) = *event {
+                if e.sock_id == sock_id && e.kind == kind {
+                    break;
+                }
+            }
+            // cvarがnotifyされるまでeventのロックを外して待機
+            event = cvar.wait(event).unwrap();
+        }
+        dbg!(&event);
+        *event = None;
+    }
+
+    /// 指定のソケットIDにイベントを発行する
+    fn publish_event(&self, sock_id: SockID, kind: TCPEventKind) {
+        let (lock, cvar) = &self.event_condvar;
+        let mut e = lock.lock().unwrap();
+        *e = Some(TCPEvent::new(sock_id, kind));
+        cvar.notify_all();
     }
 
     // SYNSENT状態のソケットに到着したパケットの処理
@@ -221,4 +247,24 @@ fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr> {
     let ip = output.next().context("failed to get src ip")?;
     dbg!("source addr", ip);
     ip.parse().context("failed to parse source ip")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TCPEvent {
+    sock_id: SockID, //イベント発生元のソケットID
+    kind: TCPEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TCPEventKind {
+    ConnectionCompleted,
+    Acked,
+    DataArrived,
+    ConnectionClosed,
+}
+
+impl TCPEvent {
+    fn new(sock_id: SockID, kind: TCPEventKind) -> Self {
+        Self { sock_id, kind }
+    }
 }
