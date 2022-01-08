@@ -83,6 +83,30 @@ impl TCP {
     }
 }
 
-fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr>{
-    Ok("10.0.0.1".parse().unwrap())
+// 宛先IPアドレスに対する送信元インタフェースのIPアドレスを取得する
+// iproute2-ss170129で動作確認。バージョンによって挙動が変わるかも。
+//
+// $ ip -V
+// ip utility, iproute2-ss200127
+// $ sudo ip netns exec host2 ip route get 10.0.0.1
+// 10.0.0.1 via 10.0.1.254 dev host2-veth1 src 10.0.1.1 uid 0
+// cache
+fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr> {
+    // ipコマンドを利用して、指定の宛先に対するローカルのIPアドレスを取得する
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ip route get {} | grep src", addr))
+        .output()?;
+    // src句の後ろにある文字列が送信元IPアドレス
+    let mut output = str::from_utf8(&output.stdout)?
+        .trim()
+        .split_ascii_whitespace();
+    while let Some(s) = output.next() {
+        if s == "src" {
+            break;
+        }
+    }
+    let ip = output.next().context("failed to get src ip")?;
+    dbg!("source addr", ip);
+    ip.parse().context("failed to parse source ip")
 }
