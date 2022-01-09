@@ -78,12 +78,33 @@ pub struct Socket {
     // TCPソケットが管理するコネクションの状態を保持する
     pub status: TcpStatus,
 
+    // 再送用のセグメントを保管するキュー
+    pub retransmission_queue: VecDeque<RetransmissionQueueEntry>,
+
     // 接続済みソケットを保持するキュー。リスニングソケットのみ使用
     pub connected_connection_queue: VecDeque<SockID>,
 
     // 生成元のリスニングソケット。接続済みソケットのみ使用
     pub listening_socket: Option<SockID>,
     pub sender: TransportSender,
+}
+
+// タイムアウト判定のために最終送信時刻と送信回数が保存される。
+#[derive(Clone, Debug)]
+pub struct RetransmissionQueueEntry {
+    pub packet: TCPPacket,
+    pub latest_transmission_time: SystemTime,
+    pub transmission_count: u8,
+}
+
+impl RetransmissionQueueEntry {
+    fn new(packet: TCPPacket) -> Self {
+        Self {
+            packet,
+            latest_transmission_time: SystemTime::now(),
+            transmission_count: 1,
+        }
+    }
 }
 
 // SnedParam構造体パラメータの位置関係
@@ -181,6 +202,7 @@ impl Socket {
                 tail: 0,
             },
             status,
+            retransmission_queue: VecDeque::new(),
             connected_connection_queue: VecDeque::new(),
             listening_socket: None,
             sender,
@@ -216,6 +238,13 @@ impl Socket {
             .send_to(tcp_packet.clone(), IpAddr::V4(self.remote_addr))
             .context(format!("failed to send: \n{:?}", tcp_packet))?;
         dbg!("sent", &tcp_packet);
+        // 単純な確認応答のようなペイロードを持たないACKセグメントは再送対象にならない.
+        // ∵ ACKセグメントのを再送しようとするとそのACKセグメントが必要になり、そのまたACKセグメントが...となってしまうため
+        if payload.is_empty() && tcp_packet.get_flag() == tcpflags::ACK {
+            return Ok(sent_size);
+        }
+        self.retransmission_queue
+            .push_back(RetransmissionQueueEntry::new(tcp_packet));
         Ok(sent_size)
     }
 
