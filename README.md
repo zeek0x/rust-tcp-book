@@ -243,3 +243,43 @@ listening on host1-veth1, link-type EN10MB (Ethernet), capture size 262144 bytes
 15:00:25.177250 IP 10.0.0.1.47013 > 10.0.1.1.40000: Flags [P.], seq 7:12, ack 1, win 4380, length 5
 15:00:25.177278 IP 10.0.1.1.40000 > 10.0.0.1.47013: Flags [.], ack 12, win 64229, length 0
 ```
+
+## 3.7.5 動作確認
+
+単体でクライアントを実行する。
+
+```console
+$ sudo ip netns exec host1 ./target/debug/examples/echoclient 10.0.1.1 40000
+...
+[src/tcp.rs:461] "source addr" = "source addr"
+[src/tcp.rs:461] ip = "10.0.0.1"
+[src/socket.rs:240] "sent" = "sent"
+[src/socket.rs:240] &tcp_packet =
+        src: 48410
+        dst: 40000
+        flag: SYN
+        payload_len: 0
+[src/tcp.rs:64] "successfully acked" = "successfully acked"
+[src/tcp.rs:64] item.packet.get_seq() = 1001911608
+[src/tcp.rs:79] "retransmit" = "retransmit"
+[src/tcp.rs:79] "retransmit" = "retransmit"
+[src/tcp.rs:79] "retransmit" = "retransmit"
+[src/tcp.rs:79] "retransmit" = "retransmit"
+[src/tcp.rs:90] "reached MAX_TRANSMITTION" = "reached MAX_TRANSMITTION
+```
+
+次に、サーバにnetcatを利用し、tcコマンドを用いてパケットロスを発生させつつクライアントを実行する。
+
+```console
+$ sudo ip netns exec host2 nc -l 10.0.1.1 40000
+```
+
+```console
+$ sudo ip netns exec host1 tc qdisc add dev host1-veth1 root netem loss 50%
+```
+
+```console
+$ sudo ip netns exec host1 ./target/debug/examples/echoclient 10.0.1.1 40000
+```
+
+しかし、前節と同様に動作しない。
