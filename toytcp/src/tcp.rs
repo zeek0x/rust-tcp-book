@@ -322,6 +322,28 @@ impl TCP {
         self.wait_event(sock_id, TCPEventKind::ConnectionCompleted);
         Ok(sock_id)
     }
+
+    // バッファのデータを送信する。必要であれば複数のパケットに分割して送信する。
+    // 全て送信したら（まだackされてなくても）リターンする。
+    pub fn send(&self, sock_id: SockID, buffer: &[u8]) -> Result<()> {
+        let mut cursor = 0;
+        while cursor < buffer.len() {
+            let mut table = self.sockets.write().unwrap();
+            let mut socket = table
+                .get_mut(&sock_id)
+                .context(format!("no such socket: {:?}", sock_id))?;
+            let send_size = cmp::min(MSS, buffer.len() - cursor);
+            socket.send_tcp_packet(
+                socket.send_param.next,
+                socket.recv_param.next,
+                tcpflags::ACK,
+                &buffer[cursor..cursor + send_size],
+            )?;
+            cursor += send_size;
+            socket.send_param.next += send_size as u32;
+        }
+        Ok(())
+    }
 }
 
 // 宛先IPアドレスに対する送信元インタフェースのIPアドレスを取得する
