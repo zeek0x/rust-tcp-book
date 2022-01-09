@@ -169,3 +169,77 @@ $ sudo ip netns exec host2 ./target/debug/examples/echoclient 10.0.0.1 40000
     },
 )
 ```
+
+## 3.7.3 動作確認
+
+サーバにはnetcatを用いる。
+
+```console
+$ sudo ip netns exec host2 nc -l 10.0.1.1 40000
+```
+
+クライアントを実行する。
+
+```console
+$ sudo ip netns exec host1 ./target/debug/examples/echoclient 10.0.1.1 40000
+...
+[src/tcp.rs:166] "status: synsend ->" = "status: synsend ->"
+[src/tcp.rs:166] &socket.status = ESTABLISHED
+[src/tcp.rs:60] &event = Some(
+    TCPEvent {
+        sock_id: SockID(
+            10.0.0.1,
+            10.0.1.1,
+            47013,
+            40000,
+        ),
+        kind: ConnectionCompleted,
+    },
+)
+hello
+[src/socket.rs:218] "sent" = "sent"
+[src/socket.rs:218] &tcp_packet =
+        src: 47013
+        dst: 40000
+        flag: ACK PSH
+        payload_len: 6
+[src/tcp.rs:247] "not implemented state" = "not implemented state"
+hoge
+[src/socket.rs:218] "sent" = "sent"
+[src/socket.rs:218] &tcp_packet =
+        src: 47013
+        dst: 40000
+        flag: ACK PSH
+        payload_len: 5
+[src/tcp.rs:247] "not implemented state" = "not implemented state"
+```
+
+netcat側に送信した文字列が出力されるはずだが、何も出力されない。
+
+```console
+# Expected
+hello
+hoge
+
+# Actual
+```
+
+tcpdumpのログ
+
+```console
+$ sudo ip netns exec host1 tcpdump -l
+tcpdump: verbose output suppressed, use -v or -vv for full protocol decode
+listening on host1-veth1, link-type EN10MB (Ethernet), capture size 262144 bytes
+15:00:17.183995 IP 10.0.1.1.40000 > 10.0.0.1.49039: Flags [F.], seq 4256132755, ack 2086109783, win 64240, length 0
+15:00:18.556665 IP 10.0.0.1.43360 > 10.0.1.1.40000: Flags [S], seq 400946233, win 4380, length 0
+15:00:18.556698 IP 10.0.1.1.40000 > 10.0.0.1.43360: Flags [S.], seq 1775177938, ack 400946234, win 64240, options [mss 1460], length 0
+15:00:18.557123 IP 10.0.0.1.43360 > 10.0.1.1.40000: Flags [.], ack 1, win 4380, length 0
+15:00:18.560197 IP 10.0.0.1.47013 > 10.0.1.1.40000: Flags [S], seq 653014473, win 4380, length 0
+15:00:18.560219 IP 10.0.1.1.40000 > 10.0.0.1.47013: Flags [S.], seq 1906374430, ack 653014474, win 64240, options [mss 1460], length 0
+15:00:18.560310 IP 10.0.0.1.47013 > 10.0.1.1.40000: Flags [.], ack 1, win 4380, length 0
+15:00:23.511566 IP 10.0.0.1.47013 > 10.0.1.1.40000: Flags [P.], seq 1:7, ack 1, win 4380, length 6
+15:00:23.511592 IP 10.0.1.1.40000 > 10.0.0.1.47013: Flags [.], ack 7, win 64234, length 0
+15:00:23.840444 IP 10.0.1.1.40000 > 10.0.0.1.49039: Flags [F.], seq 0, ack 1, win 64240, length 0
+15:00:25.177250 IP 10.0.0.1.47013 > 10.0.1.1.40000: Flags [P.], seq 7:12, ack 1, win 4380, length 5
+15:00:25.177278 IP 10.0.1.1.40000 > 10.0.0.1.47013: Flags [.], ack 12, win 64229, length 0
+```
