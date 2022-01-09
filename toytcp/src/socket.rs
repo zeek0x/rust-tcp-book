@@ -77,6 +77,7 @@ pub struct Socket {
 
     // TCPソケットが管理するコネクションの状態を保持する
     pub status: TcpStatus,
+    pub recv_buffer: Vec<u8>,
 
     // 再送用のセグメントを保管するキュー
     pub retransmission_queue: VecDeque<RetransmissionQueueEntry>,
@@ -202,6 +203,7 @@ impl Socket {
                 tail: 0,
             },
             status,
+            recv_buffer: vec![0; SOCKET_BUFFER_SIZE],
             retransmission_queue: VecDeque::new(),
             connected_connection_queue: VecDeque::new(),
             listening_socket: None,
